@@ -1,0 +1,284 @@
+//@version=5
+strategy("MohSoudEnhanced", overlay=true, initial_capital=10000, commission_type=strategy.commission.percent, commission_value=0.05, calc_on_every_tick=true, process_orders_on_close=true, pyramiding=0, max_boxes_count=500)
+
+// ─── INPUTS ───────────────────────────────────────────────────────────────────
+// Signal
+tradeDir   = input.string("Both", "Allowed Direction", options=["Long","Short","Both"], group="Signal")
+DIR_REV    = "Reversal (bounce off MA)"
+DIR_BRK    = "Breakthrough (inverse)"
+dirLogic   = input.string(DIR_REV, "Direction Logic", options=[DIR_REV, DIR_BRK], group="Signal")
+
+// MA Touch reversal — one dedicated MA. Candle touching it opens REVERSE to candle.
+touchType  = input.string("EMA", "Touch MA Type", options=["EMA","SMA","VWMA"], group="MA Touch")
+touchLen   = input.int(50, "Touch MA Length", minval=1, group="MA Touch")
+touchSrc   = input.source(close, "Touch MA Source", group="MA Touch")
+touchTF    = input.string("", "Touch MA Timeframe (blank = chart)", options=["","1","5","15","30","60","120","240","D","W","M"], group="MA Touch")
+TOUCH_NOW  = "Immediate on touch bar"
+TOUCH_BRK  = "Break of touch candle extreme"
+touchEntry = input.string(TOUCH_NOW, "Touch Entry", options=[TOUCH_NOW, TOUCH_BRK], group="MA Touch")
+useEntryTO = input.bool(true, "Break entry: cancel if unfilled", group="MA Touch")
+entryTOBar = input.int(5, "Break entry: cancel after N bars", minval=1, group="MA Touch")
+useQuality = input.bool(false, "Touch must close on reversal side of MA", group="MA Touch")
+
+// MA Slope Filter — normalized slope of the Touch MA, two modes
+useSlopeF  = input.bool(false, "Use MA Slope Filter", group="MA Slope Filter")
+SLOPE_AVOID = "Avoid: block trades against a steep slope"
+SLOPE_GET   = "Get: only trade with the slope"
+slopeMode  = input.string(SLOPE_AVOID, "Slope Mode", options=[SLOPE_AVOID, SLOPE_GET], group="MA Slope Filter")
+slopeLen   = input.int(5, "Slope Lookback (bars)", minval=1, group="MA Slope Filter")
+slopeThr   = input.float(0.05, "Slope Threshold (% per lookback)", minval=0.0, step=0.01, group="MA Slope Filter")
+
+// RSI Filter — threshold rules on the last CLOSED bar of the chosen timeframe
+useRSI     = input.bool(false, "Use RSI Filter", group="RSI Filter")
+rsiTF      = input.string("", "RSI Timeframe (blank = chart)", options=["","1","5","15","30","60","120","240","D","W","M"], group="RSI Filter")
+rsiLen     = input.int(14, "RSI Length", minval=1, group="RSI Filter")
+rsiOS      = input.float(30, "Long only if RSI <", group="RSI Filter")
+rsiOB      = input.float(70, "Short only if RSI >", group="RSI Filter")
+
+// RSI Divergence — regular divergence (price vs RSI pivots). Bull → long, bear → short.
+useDiv     = input.bool(false, "Use RSI Divergence", group="RSI Divergence")
+divTF      = input.string("", "Divergence Timeframe (blank = chart)", options=["","1","5","15","30","60","120","240","D","W","M"], group="RSI Divergence")
+divRsiLen  = input.int(14, "Divergence RSI Length", minval=1, group="RSI Divergence")
+divPivL    = input.int(5, "Pivot Lookback Left", minval=1, group="RSI Divergence")
+divPivR    = input.int(5, "Pivot Lookback Right", minval=1, group="RSI Divergence")
+divMaxBars = input.int(60, "Max bars between pivots", minval=1, group="RSI Divergence")
+divHold    = input.int(5, "Divergence valid for N bars", minval=1, group="RSI Divergence")
+
+// Money management
+riskPct    = input.float(1.0, "Balance Risk % per position", minval=0.01, step=0.1, group="Money Management")
+leverage   = input.float(10.0, "Leverage", minval=1.0, step=1.0, group="Money Management")
+
+// Risk:Reward
+RR         = input.float(1.5, "Risk:Reward Ratio", minval=0.1, step=0.1, group="Targets")
+
+// Stop loss behavior
+useStructTrail = input.bool(false, "Structural SL trail (OFF = fixed SL)", group="Stop Loss")
+
+// Take profit behavior
+TP_RR      = "Fixed R:R target"
+TP_RIDE    = "Ride (trail stop, no fixed target)"
+tpMode     = input.string(TP_RR, "Take Profit Type", options=[TP_RR, TP_RIDE], group="Take Profit")
+
+// Risk-free / break-even
+useBE      = input.bool(false, "Risk-Free (move SL to break-even)", group="Break-Even")
+beTrigger  = input.float(1.0, "BE Trigger (R multiple of profit)", minval=0.1, step=0.1, group="Break-Even")
+beOffset   = input.int(0, "BE Offset (ticks beyond entry)", group="Break-Even")
+
+// Time exit — close if TP not reached within N bars
+useTimeExit = input.bool(false, "Time Exit: close if TP not reached in N bars", group="Time Exit")
+timeExitBar = input.int(20, "Close after N bars in trade", minval=1, group="Time Exit")
+TE_ANY = "Any open trade"
+TE_BE  = "Only when break-even is active"
+teMode  = input.string(TE_ANY, "Time Exit applies to", options=[TE_ANY, TE_BE], group="Time Exit")
+
+// Fee-aware gate — skip trades whose stop distance can't clear round-trip fees
+useMinStop = input.bool(true, "Require min stop distance (fee-aware)", group="Fee Gate")
+feeSidePct = input.float(0.05, "Fee per side (%)", minval=0.0, step=0.01, group="Fee Gate")
+feeEdgeX   = input.float(2.0, "Min stop = X × round-trip fee", minval=1.0, step=0.5, group="Fee Gate")
+
+// Visuals
+showZones  = input.bool(true, "Show Position Zones (boxes)", group="Visuals")
+
+// ─── RSI DIVERGENCE (regular; price vs RSI pivots, on its own timeframe) ──────
+f_div(_rsiLen, _pivL, _pivR, _maxBars) =>
+    _r  = ta.rsi(close, _rsiLen)
+    _ph = ta.pivothigh(_r, _pivL, _pivR)
+    _pl = ta.pivotlow(_r,  _pivL, _pivR)
+    var float pPLr = na
+    var float pPLp = na
+    var int   pPLb = na
+    var float pPHr = na
+    var float pPHp = na
+    var int   pPHb = na
+    _bull = false
+    _bear = false
+    if not na(_pl)
+        _pxLow = low[_pivR]
+        if not na(pPLr) and (bar_index - pPLb) <= _maxBars and _pxLow < pPLp and _pl > pPLr
+            _bull := true
+        pPLr := _pl
+        pPLp := _pxLow
+        pPLb := bar_index
+    if not na(_ph)
+        _pxHigh = high[_pivR]
+        if not na(pPHr) and (bar_index - pPHb) <= _maxBars and _pxHigh > pPHp and _ph < pPHr
+            _bear := true
+        pPHr := _ph
+        pPHp := _pxHigh
+        pPHb := bar_index
+    [_bull, _bear]
+
+_divTFuse = divTF == "" ? timeframe.period : divTF
+[divBull, divBear] = request.security(syminfo.tickerid, _divTFuse, f_div(divRsiLen, divPivL, divPivR, divMaxBars), lookahead=barmerge.lookahead_off)
+divBullOK = ta.barssince(divBull) <= divHold
+divBearOK = ta.barssince(divBear) <= divHold
+
+// ─── RSI THRESHOLD (own TF; last closed bar for HTF) ─────────────────────────
+rsiVal = rsiTF == "" ? ta.rsi(close, rsiLen) : request.security(syminfo.tickerid, rsiTF, ta.rsi(close, rsiLen)[1], lookahead=barmerge.lookahead_off)
+
+rsiLongOK  = (not useRSI or rsiVal < rsiOS) and (not useDiv or divBullOK)
+rsiShortOK = (not useRSI or rsiVal > rsiOB) and (not useDiv or divBearOK)
+
+// ─── MA (own TF; last closed bar for HTF non-repainting, live on chart TF) ────
+f_ma(_type, _len, _src, _tf) =>
+    _v = _type == "EMA" ? ta.ema(_src, _len) : _type == "VWMA" ? ta.vwma(_src, _len) : ta.sma(_src, _len)
+    _tf == "" ? _v : request.security(syminfo.tickerid, _tf, _v[1], lookahead=barmerge.lookahead_off)
+
+// ─── MA TOUCH (dedicated MA; direction logic selectable) ─────────────────────
+touchMA    = f_ma(touchType, touchLen, touchSrc, touchTF)
+touched    = not na(touchMA) and low <= touchMA and high >= touchMA
+fromAbove  = touched and (open > touchMA or (open == touchMA and close > touchMA))
+fromBelow  = touched and (open < touchMA or (open == touchMA and close < touchMA))
+// Reversal: bounce off the MA (from above → long). Breakthrough: inverse (from above → short).
+touchLong  = dirLogic == DIR_REV ? fromAbove : fromBelow
+touchShort = dirLogic == DIR_REV ? fromBelow : fromAbove
+
+// ─── FILTERS (each independent) ──────────────────────────────────────────────
+// Touch quality — candle closes back on the reversal side of the MA
+qualLong  = not useQuality or close > touchMA
+qualShort = not useQuality or close < touchMA
+
+// MA slope (normalized: % change of Touch MA over the lookback)
+slopeVal = (touchMA - touchMA[slopeLen]) / touchMA[slopeLen] * 100
+// AVOID mode: block only counter-trades against a STEEP slope (flat passes both)
+// GET mode:   require the slope to favor the trade direction
+slopeLongOK  = not useSlopeF or (slopeMode == SLOPE_AVOID ? slopeVal > -slopeThr : slopeVal >  slopeThr)
+slopeShortOK = not useSlopeF or (slopeMode == SLOPE_AVOID ? slopeVal <  slopeThr : slopeVal < -slopeThr)
+
+// ─── POSITION SIZING (risk % + leverage cap) ─────────────────────────────────
+calcQty(entryPx, slPx) =>
+    riskAmt  = strategy.equity * riskPct / 100.0
+    stopDist = math.abs(entryPx - slPx)
+    rawQty   = stopDist > 0 ? riskAmt / stopDist : 0.0
+    maxQty   = entryPx > 0 ? (strategy.equity * leverage) / entryPx : 0.0
+    math.min(rawQty, maxQty)
+
+// ─── STATE ─────────────────────────────────────────────────────────────────────
+flat = strategy.position_size == 0
+
+longSig  = touchLong  and flat and not touchShort and rsiLongOK  and qualLong  and slopeLongOK  and tradeDir != "Short"
+shortSig = touchShort and flat and not touchLong  and rsiShortOK and qualShort and slopeShortOK and tradeDir != "Long"
+
+var float planSL     = na
+var int   pendDir    = 0    // pending break-of-candle entry
+var float pendTarget = na
+var float pendSL     = na
+var int   pendBar    = na
+
+// Stop distance must exceed X × round-trip fee (as % of price), else skip
+stopOK(_entry, _sl) =>
+    not useMinStop or math.abs(_entry - _sl) / _entry * 100 >= feeEdgeX * 2 * feeSidePct
+
+// ─── ENTRIES (all market) ─────────────────────────────────────────────────────
+if longSig
+    if touchEntry == TOUCH_NOW
+        sl = low - syminfo.mintick                 // touch candle's own low
+        if sl < close and stopOK(close, sl)
+            planSL := sl
+            strategy.entry("Long", strategy.long, qty=calcQty(close, sl))
+    else                                            // break above touch candle's high
+        trig = high
+        slT  = low - syminfo.mintick
+        if slT < trig and stopOK(trig, slT)
+            pendDir    := 1
+            pendTarget := trig
+            pendSL     := slT
+            pendBar    := bar_index
+
+if shortSig
+    if touchEntry == TOUCH_NOW
+        sl = high + syminfo.mintick                 // touch candle's own high
+        if sl > close and stopOK(close, sl)
+            planSL := sl
+            strategy.entry("Short", strategy.short, qty=calcQty(close, sl))
+    else                                            // break below touch candle's low
+        trig = low
+        slT  = high + syminfo.mintick
+        if slT > trig and stopOK(trig, slT)
+            pendDir    := -1
+            pendTarget := trig
+            pendSL     := slT
+            pendBar    := bar_index
+
+// Pending break entry: fill when a later bar breaks the touch candle's extreme; cancel on timeout
+if flat and pendDir != 0
+    if useEntryTO and (bar_index - pendBar) >= entryTOBar
+        pendDir := 0
+    else if bar_index > pendBar
+        if pendDir == 1 and high >= pendTarget
+            planSL := pendSL
+            strategy.entry("Long", strategy.long, qty=calcQty(pendTarget, pendSL))
+            pendDir := 0
+        else if pendDir == -1 and low <= pendTarget
+            planSL := pendSL
+            strategy.entry("Short", strategy.short, qty=calcQty(pendTarget, pendSL))
+            pendDir := 0
+
+// ─── TRADE STATE ──────────────────────────────────────────────────────────────
+var int   posDir      = 0
+var float entryPx     = na
+var float initSL      = na
+var float initRisk    = na
+var float curSL       = na
+var float curTP       = na
+var bool  beActive    = false
+var int   barsInTrade = 0
+var box   profitBox   = na
+var box   riskBox     = na
+
+// Signal-quality tracker (fee-independent): classify each closed trade at the LEVEL
+var int   statTP    = 0
+var int   statSL    = 0
+var int   statOther = 0
+var float statStopSum = 0.0
+var int   statN     = 0
+
+justEntered = strategy.position_size != 0 and (strategy.position_size[1] == 0 or math.sign(strategy.position_size) != math.sign(strategy.position_size[1]))
+
+if justEntered
+    posDir      := strategy.position_size > 0 ? 1 : -1
+    entryPx     := strategy.position_avg_price
+    initSL      := planSL
+    initRisk    := math.abs(entryPx - initSL)
+    curSL       := initSL
+    curTP       := tpMode == TP_RIDE ? na : (posDir == 1 ? entryPx + initRisk * RR : entryPx - initRisk * RR)
+    beActive    := false
+    barsInTrade := 0
+    pendDir     := 0
+    statStopSum += initRisk / entryPx * 100
+    statN       += 1
+
+    if showZones
+        rTop = posDir == 1 ? entryPx : curSL
+        rBot = posDir == 1 ? curSL   : entryPx
+        riskBox := box.new(bar_index - 1, rTop, bar_index, rBot, border_color=color.new(color.red, 40), bgcolor=color.new(color.red, 88))
+        if not na(curTP)
+            pTop = posDir == 1 ? curTP   : entryPx
+            pBot = posDir == 1 ? entryPx : curTP
+            profitBox := box.new(bar_index - 1, pTop, bar_index, pBot, border_color=color.new(color.green, 40), bgcolor=color.new(color.green, 88))
+
+// ─── MANAGE OPEN POSITION (SL/TP fill at level; time-exit is market) ─────────
+if strategy.position_size != 0
+    barsInTrade := barsInTrade + 1
+
+    // Break-even (optional) — not on the entry bar itself
+    if useBE and barsInTrade >= 2
+        beLevel = entryPx + posDir * beOffset * syminfo.mintick
+        if posDir == 1 and high >= entryPx + initRisk * beTrigger
+            curSL    := math.max(curSL, beLevel)
+            beActive := true
+        if posDir == -1 and low <= entryPx - initRisk * beTrigger
+            curSL    := math.min(curSL, beLevel)
+            beActive := true
+
+    // Structural SL trail — on when enabled, or forced when riding past TP
+    if (useStructTrail or tpMode == TP_RIDE) and barsInTrade >= 2
+        if posDir == 1
+            curSL := math.max(curSL, low[1] - syminfo.mintick)
+        else
+            curSL := math.min(curSL, high[1] + syminfo.mintick)
+
+    // Exit orders — fill at the exact SL/TP level
+    if posDir == 1
+        if tpMode == TP_RIDE
+            strategy.exit("Exit Long", "Long",
